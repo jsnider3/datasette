@@ -133,10 +133,14 @@ async def test_row_stream_respects_filters_and_sort(ds):
 
 
 async def test_row_stream_pages(ds):
+    # Streaming fetches max_returned_rows at a time, not default_page_size
     response = await ds.client.get("/data/numbers.pagesizes?_stream=1")
-    assert response.text.split() == ["10", "10", "10", "5"]
+    assert response.text.split() == ["35"]
+    # ... unless ?_size= asks for something else
     response = await ds.client.get("/data/numbers.pagesizes?_stream=1&_size=20")
     assert response.text.split() == ["20", "15"]
+    response = await ds.client.get("/data/numbers.pagesizes?_stream=1&_size=10")
+    assert response.text.split() == ["10", "10", "10", "5"]
     response = await ds.client.get("/data/numbers.pagesizes")
     assert response.text.split() == ["10"]
 
@@ -229,7 +233,7 @@ async def test_error_fetching_a_later_page_aborts_the_response(ds, monkeypatch):
 
     monkeypatch.setattr(table, "table_view_data", broken_on_third_page)
     with pytest.raises(ValueError, match="database went away"):
-        await ds.client.get("/data/numbers.csv?_stream=1")
+        await ds.client.get("/data/numbers.csv?_stream=1&_size=10")
     assert calls == [None, "10", "20"]
 
 
@@ -297,3 +301,98 @@ async def test_expanded_columns_extra(ds_client):
         await ds_client.get("/fixtures/facetable.json?_extra=expanded_columns&_size=1")
     ).json()
     assert data["expanded_columns"] == []
+
+
+@pytest.mark.asyncio
+async def test_row_stream_pages_are_max_returned_rows(plugin):
+    ds = _make_datasette(max_returned_rows=15)
+    await _add_numbers(ds)
+    try:
+        response = await ds.client.get("/data/numbers.pagesizes?_stream=1")
+        assert response.text.split() == ["15", "15", "5"]
+        # A size set in the table configuration does not apply to streaming
+        ds.config = {"databases": {"data": {"tables": {"numbers": {"size": 5}}}}}
+        response = await ds.client.get("/data/numbers.pagesizes")
+        assert response.text.split() == ["5"]
+        response = await ds.client.get("/data/numbers.pagesizes?_stream=1")
+        assert response.text.split() == ["15", "15", "5"]
+    finally:
+        ds.close()
+
+
+@pytest.mark.asyncio
+async def test_export_dialog_groups_formats_that_can_stream(ds):
+    from bs4 import BeautifulSoup
+
+    # A later page, so "Include all rows" is offered for this small table
+    response = await ds.client.get("/data/numbers?_next=10")
+    dialog = BeautifulSoup(response.text, "html.parser").select_one("#export-dialog")
+    form = dialog.select_one("form.export-csv-form")
+    # Formats that accept row_stream share the form with TSV and CSV, so
+    # "Include all rows" applies to them
+    formats = [row["data-export-format"] for row in form.select(".export-option")]
+    assert formats[:2] == ["tsv", "csv"]
+    assert sorted(formats[2:]) == ["big", "ndjson", "pagesizes"]
+    assert form.select_one("input[name=_stream]") is not None
+    ndjson = form.select_one('[data-export-format="ndjson"]')
+    assert {
+        button["data-export-action"]: (button["type"], button.get("formaction"))
+        for button in ndjson.select("button")
+    } == {
+        "copy": ("button", None),
+        "view": ("submit", "/data/numbers.ndjson"),
+        "download": ("submit", "/data/numbers.ndjson"),
+        "copy-url": ("button", None),
+    }
+    # They return up to max_returned_rows rows, like CSV
+    assert ndjson.select_one(".export-rows")["data-export-rows"] == "csv"
+    # Formats that cannot stream stay in the list below, as links
+    other = dialog.select_one("ul.export-options")
+    assert other.select_one('a[href^="/data/numbers.notstreaming"]') is not None
+    assert other.select_one('a[href^="/data/numbers.ndjson"]') is None
+    assert form.select_one('[formaction="/data/numbers.notstreaming"]') is None
+
+
+@pytest.mark.asyncio
+async def test_export_dialog_binary_format_that_can_stream(ds):
+    from bs4 import BeautifulSoup
+
+    def render_binary(row_stream):
+        async def body():
+            async for row in row_stream:
+                yield bytes([row["id"]])
+
+        return Response.stream(body(), content_type="application/octet-stream")
+
+    class BinaryPlugin:
+        __name__ = "BinaryPlugin"
+
+        @hookimpl
+        def register_output_renderer(self):
+            return {
+                "extension": "bin",
+                "render": render_binary,
+                "label": "Binary",
+                "is_binary": True,
+            }
+
+    pm.register(BinaryPlugin(), name="binary_renderer")
+    try:
+        binary_ds = _make_datasette()
+        await _add_numbers(binary_ds)
+        response = await binary_ds.client.get("/data/numbers?_next=10")
+        binary_ds.close()
+    finally:
+        pm.unregister(name="binary_renderer")
+    dialog = BeautifulSoup(response.text, "html.parser").select_one("#export-dialog")
+    row = dialog.select_one('form.export-csv-form [data-export-format="bin"]')
+    assert row["data-export-kind"] == "binary"
+    # Binary formats offer Download and Copy URL, not Copy or View
+    assert [
+        (button["data-export-action"], button.get("formaction"))
+        for button in row.select("button")
+    ] == [("download", "/data/numbers.bin"), ("copy-url", None)]
+    assert row.select_one(".export-option-name").text == "Binary"
+    note = dialog.select_one("#export-page-note").text
+    assert "to export every row as TSV, CSV, " in note
+    assert "Binary" in note
